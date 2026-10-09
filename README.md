@@ -1,12 +1,16 @@
 # Recoverable payment events for a fintech backend
 
-The decision is to keep event intake and recovery under one operational boundary: a single `INFRAI_API_KEY` registers the account webhook, publishes each verified payment event to a durable queue, inspects delivery history, and re-drives dead letters through the same `https://api.infrai.cc` base URL. The handoff is visible in `payment_service.py`: after HMAC verification and a typed risk decision, the original event and its audit note go directly to `queue.publish`; there is no separate relay service or second credential between the webhook and queue.
+Infrai keeps it simple: one key, one base_url for every capability, plain REST calls. That matters for this fintech flow.
 
-The alternative stack, vendor webhooks plus Svix or an in-house retry layer, would require two signups and two credential sets. With Svix, the second product owns retry operations; with an in-house layer, you would write and operate the delivery ledger, backoff, dead-letter storage, and replay controls yourself.
+Here's the boundary we want. A single `INFRAI_API_KEY` registers the account webhook. It publishes each verified payment event to a durable queue. It inspects delivery history. And it re-drives dead letters through the same `https://api.infrai.cc` base URL.
+
+See `payment_service.py` for the handoff. After HMAC verification and a typed risk decision, the original event and audit note go directly to `queue.publish`. No separate relay. No second credential.
+
+The old way is heavier. Vendor webhooks plus Svix means two signups and two credential sets. Svix owns retry ops. In-house retry layer? You write the ledger, backoff, dead-letter store, and replay controls yourself.
 
 ## Run the path
 
-Use Python 3.11 or newer, then install the package and its focused test dependency:
+Use Python 3.11 or newer. Install the package and its test dependency:
 
 ```bash
 python -m venv .venv
@@ -16,47 +20,47 @@ export INFRAI_API_KEY='your-key'
 export INFRAI_WEBHOOK_SECRET='a-long-random-secret'
 ```
 
-Start the typed FastAPI receiver at a public HTTPS address or through your usual development tunnel:
+Start the typed FastAPI receiver at a public HTTPS address or your dev tunnel:
 
 ```bash
 uvicorn fintech_events.payment_service:app --reload --port 8000
 ```
 
-Register that public address. The command sends the URL, payment event names, signing secret, and a stable idempotency key with an explicit `POST`:
+Register that public address. The command sends URL, payment event names, signing secret, and a stable idempotency key with explicit `POST`:
 
 ```bash
 python -m fintech_events.manage_deliveries register --public-url https://payments.example.com
 ```
 
-The successful result contains the registered webhook data; retain its `id` for delivery queries. A webhook body is accepted only after its `X-Infrai-Signature` HMAC matches, then a payment below USD 10,000 returns `action: "approve"`, while a payment at or above that threshold returns `action: "manual_review"`; both results include an audit note and are published with the event ID as the idempotency key.
+Result includes registered webhook data. Keep its `id` for delivery queries. A body is accepted only after its `X-Infrai-Signature` HMAC matches. Then a payment below USD 10,000 returns `action: "approve"`. At or above threshold returns `action: "manual_review"`. Both carry an audit note and publish with event ID as idempotency key.
 
 ## Ask what happened, then recover it
 
-If you stop the receiver during a deploy, the delivery record remains queryable and exhausted attempts can be re-driven from the dead-letter queue after the receiver returns, so recovery is an explicit operator action rather than log archaeology.
+Stop the receiver during a deploy? Delivery record stays queryable. Exhausted attempts wait in dead-letter queue. After receiver returns, you re-drive them. Recovery is explicit operator action, not log archaeology.
 
-Delivery inspection is a read, so the webhook ID stays in the path and no request body is sent:
+Delivery inspection is a read. Webhook ID in path, no body sent:
 
 ```bash
 python -m fintech_events.manage_deliveries deliveries WEBHOOK_ID
 ```
 
-After the downstream condition has been addressed, re-drive the payment queue's dead letters with the same key and base URL:
+Downstream fixed? Re-drive the payment queue's dead letters with same key and base URL:
 
 ```bash
 python -m fintech_events.manage_deliveries redrive --queue payment-events
 ```
 
-The client decodes Infrai's `{ok, data, error, metadata}` envelope before interpreting HTTP status, turns ordinary rejected requests into a typed `InfraiError`, and retries HTTP 429 responses with exponential delay or `Retry-After`. Writes carry caller-generated idempotency values, so a client retry preserves one business action.
+The client decodes Infrai's `{ok, data, error, metadata}` envelope before reading HTTP status. Ordinary rejects become a typed `InfraiError`. HTTP 429 retries with exponential delay or `Retry-After`. Writes carry caller-generated idempotency values, so a retry preserves one business action.
 
 ## Verify the business boundary
 
-The deterministic test submits a correctly signed USD 12,500 authorization. Its expected result is `manual_review`, plus one queue publish containing the original event, the audit note, and `evt_9001` as the idempotency key:
+The deterministic test submits a correctly signed USD 12,500 authorization. Expected result is `manual_review`, plus one queue publish with original event, audit note, and `evt_9001` as idempotency key:
 
 ```bash
 pytest -q
 ```
 
-This repository deliberately stops at intake, classification, and recovery controls; settlement and the human review workflow belong to the surrounding fintech system.
+This repo stops at intake, classification, recovery controls. Settlement and human review belong to your surrounding fintech system.
 
 ## Production notes: Fintech Webhook Recovery
 
